@@ -13,13 +13,14 @@ import html
 import os
 import sys
 import re
+import json as _json
 import urllib.request
 import urllib.parse
 from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
 
 DEVOTION_URL = "https://www.intouchglobal.org/read/daily-devotions"
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MAX_MSG = 4000
 
 
@@ -36,6 +37,29 @@ def fetch_html(url):
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def already_sent_today(token, chat_id):
+    """Check recent bot messages to see if today's devotion was already sent."""
+    sgt = timezone(timedelta(hours=8))
+    today_str = datetime.now(sgt).strftime("%A, %B %-d, %Y")
+    try:
+        url = TELEGRAM_API.format(token=token, method="getUpdates") + "?offset=-20&limit=20"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read().decode())
+        if not data.get("ok"):
+            return False
+        for update in data.get("result", []):
+            msg = update.get("message") or update.get("channel_post") or {}
+            if str(msg.get("chat", {}).get("id")) == str(chat_id):
+                from_user = msg.get("from", {})
+                if from_user.get("is_bot") and today_str in (msg.get("text") or ""):
+                    print(f"Already sent today ({today_str}). Skipping.")
+                    return True
+    except Exception as e:
+        print(f"Warning: could not check for duplicates: {e}")
+    return False
 
 
 class DevotionParser(HTMLParser):
@@ -153,10 +177,9 @@ def send_telegram(token, chat_id, text):
         "parse_mode": "HTML",
         "disable_web_page_preview": "false",
     }).encode()
-    req = urllib.request.Request(TELEGRAM_API.format(token=token), data=data)
+    req = urllib.request.Request(TELEGRAM_API.format(token=token, method="sendMessage"), data=data)
     with urllib.request.urlopen(req, timeout=30) as resp:
         body = resp.read().decode()
-    import json as _json
     return _json.loads(body)
 
 
@@ -166,6 +189,12 @@ def main():
     if not token or not chat_id:
         print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars are required.", file=sys.stderr)
         sys.exit(1)
+
+    # Duplicate check: skip if already sent today
+    if already_sent_today(token, chat_id):
+        print("Devotion already sent today. Exiting.")
+        sys.exit(0)
+
     print(f"Fetching {DEVOTION_URL} \u2026")
     html_src = fetch_html(DEVOTION_URL)
     parser = DevotionParser()
@@ -175,7 +204,7 @@ def main():
         print("ERROR: Could not extract devotion paragraphs.", file=sys.stderr)
         sys.exit(2)
     message = build_message(parser.title, parser.subtitle, parser.date, paragraphs)
-    print(f"Built message, length={len(message)} chars. Title={parser.title!r} Date={parser.date!r}")
+    print(f"Built message, length={len(message)} chars. Title={parser.title!r}")
     result = send_telegram(token, chat_id, message)
     if not result.get("ok"):
         print("ERROR sending to Telegram:", result, file=sys.stderr)
